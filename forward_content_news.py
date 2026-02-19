@@ -77,6 +77,10 @@ def _int(v, d=0, *, lo=None, hi=None):
     if hi is not None: i = min(i, hi)
     return i
 
+def _err(e, n=150):
+    s = str(e).replace('\n', ' ').replace('\r', ' ').strip()
+    return s[:n] if s else "Unknown error"
+
 def cancelled(u): return cancels.get(u, False)
 def cancel(u, v=True): cancels[u] = v
 def uncancel(u): cancels[u] = False
@@ -265,12 +269,32 @@ async def check_sess(uid):
 async def log_ch(ctx, uid, msg):
     ch = await db.get_log(uid)
     if not ch: return
-    try: await ctx.bot.send_message(chat_id=ch, text=msg, parse_mode='Markdown')
-    except Exception as e: print(f"[LOG] {uid}: {e}")
+    try:
+        await ctx.bot.send_message(chat_id=ch, text=msg, parse_mode='Markdown')
+    except Exception as e:
+        es = str(e).lower()
+        if "can't parse entities" in es:
+            try:
+                await ctx.bot.send_message(chat_id=ch, text=msg)
+                return
+            except Exception as e2:
+                print(f"[LOG] {uid}: {e2}")
+                return
+        print(f"[LOG] {uid}: {e}")
 
 async def tell(ctx, uid, txt):
-    try: await ctx.bot.send_message(chat_id=uid, text=txt, parse_mode='Markdown')
-    except Exception as e: print(f"[TELL] {uid}: {e}")
+    try:
+        await ctx.bot.send_message(chat_id=uid, text=txt, parse_mode='Markdown')
+    except Exception as e:
+        es = str(e).lower()
+        if "can't parse entities" in es:
+            try:
+                await ctx.bot.send_message(chat_id=uid, text=txt)
+                return
+            except Exception as e2:
+                print(f"[TELL] {uid}: {e2}")
+                return
+        print(f"[TELL] {uid}: {e}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -404,7 +428,7 @@ async def add_btns_to_post(uid, ctx, link, btns):
             return True, "ℹ️  Buttons already identical."
         if "chat not found" in es or "not a member" in es:
             return False, "❌  Cannot access channel.\n\nYour account or this bot must be admin."
-        return False, f"❌  {str(e)[:150]}"
+        return False, f"❌  {_err(e)}"
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -412,7 +436,7 @@ async def add_btns_to_post(uid, ctx, link, btns):
 #
 #  Topic routing:
 #    topic set   → forum groups get that topic, non-forum send normally
-#    topic None  → forum groups skipped, non-forum send normally
+#    topic None  → forum groups use General topic, non-forum send normally
 #
 #  Content priority:
 #    1. post_link → fetch via Telethon
@@ -516,12 +540,6 @@ async def do_broadcast(uid, content, ctx,
                     if not e.megagroup: sk_ch += 1; continue
                 elif isinstance(e, User): sk_pr += 1; continue
                 elif not isinstance(e, Chat): continue
-                try:
-                    if (hasattr(e,'default_banned_rights')
-                            and e.default_banned_rights
-                            and e.default_banned_rights.send_messages):
-                        sk_ban += 1; continue
-                except: pass
                 groups.append(e)
         except Exception as e: print(f"[SCAN] {e}")
 
@@ -545,7 +563,8 @@ async def do_broadcast(uid, content, ctx,
                 # TOPIC ROUTING
                 if is_forum:
                     if topic is None:
-                        skipped += 1; skip_g.append(title); continue
+                        # No topic selected: post to forum General topic.
+                        reply_to = 1
                     else:
                         tid = await find_topic(cl, grp, topic)
                         reply_to = tid if tid else 1
@@ -650,7 +669,7 @@ async def do_broadcast(uid, content, ctx,
 
     except Exception as e:
         print(f"CRITICAL: {traceback.format_exc()}")
-        await tell(ctx, uid, f"❌  Error: `{str(e)[:150]}`")
+        await tell(ctx, uid, f"❌  Error: {_err(e)}")
         return "Error"
     finally:
         try:
@@ -765,7 +784,7 @@ async def sched_loop(uid, interval, ctx,
                 try: await db.schedules.update_one(
                     {"user_id": uid}, {"$set": {"next_run": tgt.isoformat()}})
                 except: pass
-                await log_ch(ctx, uid, f"❌  Error #{errors}: `{str(e)[:150]}`")
+                await log_ch(ctx, uid, f"❌  Error #{errors}: {_err(e)}")
                 if errors >= 5:
                     await tell(ctx, uid, "⚠️  5 failures. Slowing down.\n/stop to cancel.")
                     await asyncio.sleep(d_iv * 60)
@@ -782,7 +801,7 @@ async def sched_loop(uid, interval, ctx,
     except asyncio.CancelledError: pass
     except Exception as e:
         print(f"[SCHED] FATAL {uid}: {e}")
-        try: await log_ch(ctx, uid, f"❌  Loop crash: `{str(e)[:200]}`")
+        try: await log_ch(ctx, uid, f"❌  Loop crash: {_err(e, 200)}")
         except: pass
 
 
@@ -1216,7 +1235,8 @@ async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "    Non-forum groups → normal delivery\n"
             "    Works in ANY language (partial match)\n\n"
             "  · Type `skip`:\n"
-            "    Only non-forum groups receive\n\n"
+            "    Forum groups use General topic\n"
+            "    Non-forum groups receive normally\n\n"
             "━━━  *Delivery Modes*  ━━━\n\n"
             "  · 👻 *Copy* — anonymous, supports buttons\n"
             "  · 📣 *Forward* — shows source header\n\n"
@@ -1250,7 +1270,7 @@ async def show_preview(obj, ctx):
     elif pl: pv = f"🔗  {pl}"
     else: pv = "–  no content  –"
 
-    td = f"`{tn}` + all non-forum groups" if tn else "non-forum groups only"
+    td = f"`{tn}` + all non-forum groups" if tn else "General topic in forums + all non-forum groups"
     ivd = "one-time, now" if iv == 0 else f"every {iv} minute(s)"
     mdd = "👻  Copy (anonymous)" if md == 'copy' else "📣  Forward (with header)"
     warn = "\n_⚠️  Buttons force Copy mode_" if bt and md == 'forward' else ""
@@ -1292,8 +1312,12 @@ async def show_preview(obj, ctx):
 #  MESSAGE HANDLER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 async def on_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not update.effective_user:
+        # Ignore channel/system messages that have no user object.
+        return
     uid = update.effective_user.id
-    if not update.message: return
 
     if context.user_data.get('w_sess'):
         context.user_data['w_sess'] = False
@@ -1312,7 +1336,7 @@ async def on_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅  Connected as *{me.first_name}*!\n\nUse /start to continue.",
                 parse_mode='Markdown')
         except Exception as e:
-            await update.message.reply_text(f"❌  `{str(e)[:150]}`\n\n/start to retry.", parse_mode='Markdown')
+            await update.message.reply_text(f"❌  {_err(e)}\n\n/start to retry.")
         context.user_data.clear()
         return
 
@@ -1326,7 +1350,7 @@ async def on_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.set_log(uid, ch)
             await update.message.reply_text(f"✅  Log channel set: `{ch}`", parse_mode='Markdown')
         except Exception as e:
-            await update.message.reply_text(f"❌  {str(e)[:100]}\n\nBot must be admin in the channel.")
+            await update.message.reply_text(f"❌  {_err(e, 100)}\n\nBot must be admin in the channel.")
         return
 
     if context.user_data.get('w_content'):
@@ -1412,7 +1436,7 @@ async def on_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ti = update.message.text.strip()
         if ti.lower() == 'skip':
             context.user_data['bc_topic'] = None
-            desc = "Non-forum groups only"
+            desc = "General topic in forums + all non-forum groups"
         else:
             context.user_data['bc_topic'] = ti.lower()
             desc = f"Topic `{ti}` in forums + all non-forum groups"
@@ -1548,7 +1572,7 @@ async def h_phone(u, c):
             parse_mode='Markdown')
         return CODE
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n\n/start to retry.", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n\n/start to retry.")
         return ConversationHandler.END
 
 async def h_code(u, c):
@@ -1570,7 +1594,7 @@ async def h_code(u, c):
         await u.message.reply_text(f"💾  Session backup:\n`{ss}`\n\n_⚠️  Keep this private!_", parse_mode='Markdown')
         return ConversationHandler.END
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n\n/start to retry.", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n\n/start to retry.")
         try:
             if cl.is_connected(): await cl.disconnect()
         except: pass
@@ -1590,7 +1614,7 @@ async def h_pw(u, c):
         await u.message.reply_text(f"💾  `{ss}`\n\n_Keep private!_", parse_mode='Markdown')
         return ConversationHandler.END
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n/start", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n/start")
         c.user_data.clear(); return ConversationHandler.END
 
 async def hg_phone(u, c):
@@ -1604,7 +1628,7 @@ async def hg_phone(u, c):
         await u.message.reply_text("✅  Code sent! Send it now:")
         return GEN_CODE
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n/start", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n/start")
         return ConversationHandler.END
 
 async def hg_code(u, c):
@@ -1626,7 +1650,7 @@ async def hg_code(u, c):
         await u.message.reply_text(f"💾  `{ss}`\n\n_Keep private!_", parse_mode='Markdown')
         return ConversationHandler.END
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n/start", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n/start")
         c.user_data.clear(); return ConversationHandler.END
 
 async def hg_pw(u, c):
@@ -1643,7 +1667,7 @@ async def hg_pw(u, c):
         await u.message.reply_text(f"💾  `{ss}`\n\n_Keep private!_", parse_mode='Markdown')
         return ConversationHandler.END
     except Exception as e:
-        await u.message.reply_text(f"❌  `{str(e)[:150]}`\n/start", parse_mode='Markdown')
+        await u.message.reply_text(f"❌  {_err(e)}\n/start")
         c.user_data.clear(); return ConversationHandler.END
 
 
@@ -1718,7 +1742,7 @@ async def pconf(u, c):
             reply_markup=mk, parse_mode='Markdown')
         await q.edit_message_text(f"✅  Posted to `{ch}`!", parse_mode='Markdown')
     except Exception as e:
-        await q.edit_message_text(f"❌  `{str(e)[:200]}`", parse_mode='Markdown')
+        await q.edit_message_text(f"❌  {_err(e, 200)}")
     return ConversationHandler.END
 
 
@@ -1761,7 +1785,10 @@ async def on_err(update, context):
     e = str(context.error)
     if any(x in e.lower() for x in ("httpx","network","timed out","not modified")): return
     print(f"Error: {context.error}")
-    try: await context.bot.send_message(Config.OWNER_ID, f"⚠️  `{e[:200]}`", parse_mode='Markdown')
+    try:
+        await context.bot.send_message(
+            Config.OWNER_ID,
+            f"⚠️  Bot error: {e[:200]}")
     except: pass
 
 
