@@ -1,0 +1,13 @@
+import asyncio
+import os
+import sys
+
+from forward_content_news import main
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Bot stopped by user.")
+    except Exception as e:
+        print(f"Error starting bot: {e}")
