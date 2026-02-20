@@ -1986,7 +1986,7 @@ def main():
         on_msg))
 
     print("Bot running...")
-    app.run_polling()
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
