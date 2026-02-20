@@ -81,6 +81,75 @@ def _err(e, n=150):
     s = str(e).replace('\n', ' ').replace('\r', ' ').strip()
     return s[:n] if s else "Unknown error"
 
+def _sent_ok(res):
+    if not res:
+        return False
+    if getattr(res, "id", None):
+        return True
+    if isinstance(res, (list, tuple)):
+        return any(getattr(x, "id", None) for x in res if x)
+    ups = getattr(res, "updates", None)
+    if ups:
+        for u in ups:
+            m = getattr(u, "message", None)
+            if m and getattr(m, "id", None):
+                return True
+            if getattr(u, "id", None):
+                return True
+    return False
+
+def _is_entity_parse_error(e):
+    s = str(e).lower()
+    return (
+        "can't parse entities" in s
+        or "can't parse entity" in s
+        or "can't find end of the entity" in s
+    )
+
+async def _retry_plain_on_parse_error(fn, *args, **kwargs):
+    try:
+        return await fn(*args, **kwargs)
+    except Exception as e:
+        if not _is_entity_parse_error(e):
+            raise
+        kw = dict(kwargs)
+        removed = False
+        for k in ("parse_mode", "entities", "caption_entities"):
+            if k in kw:
+                kw.pop(k, None)
+                removed = True
+        if not removed:
+            raise
+        return await fn(*args, **kw)
+
+def install_safe_markdown(bot):
+    # Global guard: keep Markdown formatting when valid, auto-fallback to plain text on parse errors.
+    if getattr(bot, "_ads_safe_md_installed", False):
+        return
+    bot._ads_safe_md_installed = True
+
+    orig_send_message = bot.send_message
+    orig_edit_message_text = bot.edit_message_text
+    orig_send_photo = bot.send_photo
+    orig_send_video = bot.send_video
+
+    async def _safe_send_message(*args, **kwargs):
+        return await _retry_plain_on_parse_error(orig_send_message, *args, **kwargs)
+
+    async def _safe_edit_message_text(*args, **kwargs):
+        return await _retry_plain_on_parse_error(orig_edit_message_text, *args, **kwargs)
+
+    async def _safe_send_photo(*args, **kwargs):
+        return await _retry_plain_on_parse_error(orig_send_photo, *args, **kwargs)
+
+    async def _safe_send_video(*args, **kwargs):
+        return await _retry_plain_on_parse_error(orig_send_video, *args, **kwargs)
+
+    bot.send_message = _safe_send_message
+    bot.edit_message_text = _safe_edit_message_text
+    bot.send_photo = _safe_send_photo
+    bot.send_video = _safe_send_video
+
 def cancelled(u): return cancels.get(u, False)
 def cancel(u, v=True): cancels[u] = v
 def uncancel(u): cancels[u] = False
@@ -575,17 +644,21 @@ async def do_broadcast(uid, content, ctx,
                     try:
                         if HAS_FWD_REQ:
                             from_peer = src if src else await cl.get_input_entity(tl.peer_id)
-                            await cl(ForwardMessagesRequest(
+                            fr = await cl(ForwardMessagesRequest(
                                 from_peer=from_peer, to_peer=grp,
                                 id=[tl.id],
                                 random_id=[random.randint(0, 2**63)],
                                 top_msg_id=reply_to if reply_to else None,
                                 silent=False, noforwards=False,
                                 drop_author=False))
+                            if not _sent_ok(fr):
+                                raise RuntimeError("forward returned no message id")
                         else:
                             fk = {'entity': grp, 'messages': tl.id}
                             if src: fk['from_peer'] = src
-                            await cl.forward_messages(**fk)
+                            fr = await cl.forward_messages(**fk)
+                            if not _sent_ok(fr):
+                                raise RuntimeError("forward returned no message id")
                         sent += 1; ok_g.append(f"{title} ↗")
 
                     except Exception as fe:
@@ -601,7 +674,9 @@ async def do_broadcast(uid, content, ctx,
                                     kw["file"] = tl.media
                                 else:
                                     kw["message"] = tl.text or tl.raw_text or ''
-                                await cl.send_message(**kw)
+                                sr = await cl.send_message(**kw)
+                                if not _sent_ok(sr):
+                                    raise RuntimeError("copy fallback returned no message id")
                                 sent += 1; ok_g.append(f"{title} ≈")
                             except Exception as ce:
                                 failed += 1
@@ -619,13 +694,17 @@ async def do_broadcast(uid, content, ctx,
                         kw["file"] = tl.media
                     else:
                         kw["message"] = tl.text or tl.raw_text or ''
-                    await cl.send_message(**kw)
+                    sr = await cl.send_message(**kw)
+                    if not _sent_ok(sr):
+                        raise RuntimeError("copy returned no message id")
                     sent += 1; ok_g.append(title)
 
                 # ── COPY WITH PLAIN TEXT ──
                 elif txt:
-                    await cl.send_message(
+                    sr = await cl.send_message(
                         grp, txt, reply_to=reply_to, buttons=tb)
+                    if not _sent_ok(sr):
+                        raise RuntimeError("text send returned no message id")
                     sent += 1; ok_g.append(title)
 
                 if i < len(groups) - 1:
@@ -663,7 +742,11 @@ async def do_broadcast(uid, content, ctx,
         if skip_g[:10]: log += "\n\n⏭  *Skipped:*\n" + "\n".join(f"  · {g}" for g in skip_g[:10])
 
         await log_ch(ctx, uid, log)
-        await tell(ctx, uid, f"━━  *Broadcast Complete*  ━━\n\n{summary}")
+        smp = "\n".join(f"  · {g}" for g in ok_g[:5]) if ok_g else "  · (none)"
+        await tell(
+            ctx, uid,
+            f"━━  *Broadcast Complete*  ━━\n\n{summary}\n\n"
+            f"📌  Sample delivered groups:\n{smp}")
         uncancel(uid)
         return summary
 
@@ -1778,11 +1861,13 @@ async def resume(app):
         print(f"  ⚠️ {e}"); AUTH[Config.OWNER_ID] = True
 
 async def post_init(app):
+    install_safe_markdown(app.bot)
     await db.init()
     asyncio.create_task(resume(app))
 
 async def on_err(update, context):
     e = str(context.error)
+    if _is_entity_parse_error(e): return
     if any(x in e.lower() for x in ("httpx","network","timed out","not modified")): return
     print(f"Error: {context.error}")
     try:
